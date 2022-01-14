@@ -42,6 +42,7 @@
 #include "fdbserver/IDiskQueue.h"
 #include "fdbclient/DatabaseContext.h"
 #include "fdbserver/DataDistributorInterface.h"
+#include "fdbserver/BlobManagerInterface.h"
 #include "fdbserver/ServerDBInfo.h"
 #include "fdbserver/FDBExecHelper.actor.h"
 #include "fdbserver/CoordinationInterface.h"
@@ -307,7 +308,7 @@ KeyValueStoreSuffix bTreeV1Suffix = { KeyValueStoreType::SSD_BTREE_V1, ".fdb", F
 KeyValueStoreSuffix bTreeV2Suffix = { KeyValueStoreType::SSD_BTREE_V2, ".sqlite", FilesystemCheck::FILES_ONLY };
 KeyValueStoreSuffix memorySuffix = { KeyValueStoreType::MEMORY, "-0.fdq", FilesystemCheck::FILES_ONLY };
 KeyValueStoreSuffix memoryRTSuffix = { KeyValueStoreType::MEMORY_RADIXTREE, "-0.fdr", FilesystemCheck::FILES_ONLY };
-KeyValueStoreSuffix redwoodSuffix = { KeyValueStoreType::SSD_REDWOOD_V1, ".redwood", FilesystemCheck::FILES_ONLY };
+KeyValueStoreSuffix redwoodSuffix = { KeyValueStoreType::SSD_REDWOOD_V1, ".redwood-v1", FilesystemCheck::FILES_ONLY };
 KeyValueStoreSuffix rocksdbSuffix = { KeyValueStoreType::SSD_ROCKSDB_V1,
 	                                  ".rocksdb",
 	                                  FilesystemCheck::DIRECTORIES_ONLY };
@@ -337,7 +338,7 @@ std::string filenameFromId(KeyValueStoreType storeType, std::string folder, std:
 	else if (storeType == KeyValueStoreType::MEMORY || storeType == KeyValueStoreType::MEMORY_RADIXTREE)
 		return joinPath(folder, prefix + id.toString() + "-");
 	else if (storeType == KeyValueStoreType::SSD_REDWOOD_V1)
-		return joinPath(folder, prefix + id.toString() + ".redwood");
+		return joinPath(folder, prefix + id.toString() + ".redwood-v1");
 	else if (storeType == KeyValueStoreType::SSD_ROCKSDB_V1)
 		return joinPath(folder, prefix + id.toString() + ".rocksdb");
 
@@ -517,10 +518,12 @@ ACTOR Future<Void> registrationClient(Reference<AsyncVar<Optional<ClusterControl
                                       ProcessClass initialClass,
                                       Reference<AsyncVar<Optional<DataDistributorInterface>> const> ddInterf,
                                       Reference<AsyncVar<Optional<RatekeeperInterface>> const> rkInterf,
+                                      Reference<AsyncVar<Optional<BlobManagerInterface>> const> bmInterf,
                                       Reference<AsyncVar<bool> const> degraded,
-                                      Reference<ClusterConnectionFile> connFile,
+                                      Reference<IClusterConnectionRecord> connRecord,
                                       Reference<AsyncVar<std::set<std::string>> const> issues,
-                                      Reference<LocalConfiguration> localConfig) {
+                                      Reference<LocalConfiguration> localConfig,
+                                      Reference<AsyncVar<ServerDBInfo>> dbInfo) {
 	// Keeps the cluster controller (as it may be re-elected) informed that this worker exists
 	// The cluster controller uses waitFailureClient to find out if we die, and returns from registrationReply
 	// (requiring us to re-register) The registration request piggybacks optional distributor interface if it exists.
@@ -531,7 +534,18 @@ ACTOR Future<Void> registrationClient(Reference<AsyncVar<Optional<ClusterControl
 	state Future<Void> cacheProcessFuture;
 	state Future<Void> cacheErrorsFuture;
 	state Optional<double> incorrectTime;
+	state bool firstReg = true;
 	loop {
+		state ClusterConnectionString storedConnectionString;
+		state bool upToDate = true;
+		if (connRecord) {
+			bool upToDateResult = wait(connRecord->upToDate(storedConnectionString));
+			upToDate = upToDateResult;
+		}
+		if (upToDate) {
+			incorrectTime = Optional<double>();
+		}
+
 		RegisterWorkerRequest request(interf,
 		                              initialClass,
 		                              processClass,
@@ -539,31 +553,29 @@ ACTOR Future<Void> registrationClient(Reference<AsyncVar<Optional<ClusterControl
 		                              requestGeneration++,
 		                              ddInterf->get(),
 		                              rkInterf->get(),
+		                              bmInterf->get(),
 		                              degraded->get(),
 		                              localConfig->lastSeenVersion(),
 		                              localConfig->configClassSet());
+
 		for (auto const& i : issues->get()) {
 			request.issues.push_back_deep(request.issues.arena(), i);
 		}
-		ClusterConnectionString fileConnectionString;
-		if (connFile && !connFile->fileContentsUpToDate(fileConnectionString)) {
+
+		if (!upToDate) {
 			request.issues.push_back_deep(request.issues.arena(), LiteralStringRef("incorrect_cluster_file_contents"));
-			std::string connectionString = connFile->getConnectionString().toString();
+			std::string connectionString = connRecord->getConnectionString().toString();
 			if (!incorrectTime.present()) {
 				incorrectTime = now();
 			}
-			if (connFile->canGetFilename()) {
-				// Don't log a SevWarnAlways initially to account for transient issues (e.g. someone else changing the
-				// file right before us)
-				TraceEvent(now() - incorrectTime.get() > 300 ? SevWarnAlways : SevWarn, "IncorrectClusterFileContents")
-				    .detail("Filename", connFile->getFilename())
-				    .detail("ConnectionStringFromFile", fileConnectionString.toString())
-				    .detail("CurrentConnectionString", connectionString);
-			}
-		} else {
-			incorrectTime = Optional<double>();
-		}
 
+			// Don't log a SevWarnAlways initially to account for transient issues (e.g. someone else changing
+			// the file right before us)
+			TraceEvent(now() - incorrectTime.get() > 300 ? SevWarnAlways : SevWarn, "IncorrectClusterFileContents")
+			    .detail("ClusterFile", connRecord->toString())
+			    .detail("StoredConnectionString", storedConnectionString.toString())
+			    .detail("CurrentConnectionString", connectionString);
+		}
 		auto peers = FlowTransport::transport().getIncompatiblePeers();
 		for (auto it = peers->begin(); it != peers->end();) {
 			if (now() - it->second.second > FLOW_KNOBS->INCOMPATIBLE_PEER_DELAY_BEFORE_LOGGING) {
@@ -575,6 +587,13 @@ ACTOR Future<Void> registrationClient(Reference<AsyncVar<Optional<ClusterControl
 		}
 
 		state bool ccInterfacePresent = ccInterface->get().present();
+		if (ccInterfacePresent) {
+			request.requestDbInfo = (ccInterface->get().get().id() != dbInfo->get().clusterInterface.id());
+			if (firstReg) {
+				request.requestDbInfo = true;
+				firstReg = false;
+			}
+		}
 		state Future<RegisterWorkerReply> registrationReply =
 		    ccInterfacePresent ? brokenPromiseToNever(ccInterface->get().get().registerWorker.getReply(request))
 		                       : Never();
@@ -596,6 +615,7 @@ ACTOR Future<Void> registrationClient(Reference<AsyncVar<Optional<ClusterControl
 			when(wait(ccInterface->onChange())) { break; }
 			when(wait(ddInterf->onChange())) { break; }
 			when(wait(rkInterf->onChange())) { break; }
+			when(wait(bmInterf->onChange())) { break; }
 			when(wait(degraded->onChange())) { break; }
 			when(wait(FlowTransport::transport().onIncompatibleChanged())) { break; }
 			when(wait(issues->onChange())) { break; }
@@ -616,6 +636,10 @@ bool addressInDbAndPrimaryDc(const NetworkAddress& address, Reference<AsyncVar<S
 	}
 
 	if (dbi.ratekeeper.present() && dbi.ratekeeper.get().address() == address) {
+		return true;
+	}
+
+	if (dbi.blobManager.present() && dbi.blobManager.get().address() == address) {
 		return true;
 	}
 
@@ -676,8 +700,8 @@ TEST_CASE("/fdbserver/worker/addressInDbAndPrimaryDc") {
 
 	// Manually set up a master address.
 	NetworkAddress testAddress(IPAddress(0x13131313), 1);
-	testDbInfo.master.changeCoordinators =
-	    RequestStream<struct ChangeCoordinatorsRequest>(Endpoint({ testAddress }, UID(1, 2)));
+	testDbInfo.master.getCommitVersion =
+	    RequestStream<struct GetCommitVersionRequest>(Endpoint({ testAddress }, UID(1, 2)));
 
 	// First, create an empty TLogInterface, and check that it shouldn't be considered as in primary DC.
 	testDbInfo.logSystemConfig.tLogs.push_back(TLogSet());
@@ -1082,6 +1106,7 @@ ACTOR Future<Void> storageServerRollbackRebooter(std::set<std::pair<UID, KeyValu
 		DUMPTOKEN(recruited.getValue);
 		DUMPTOKEN(recruited.getKey);
 		DUMPTOKEN(recruited.getKeyValues);
+		DUMPTOKEN(recruited.getKeyValuesAndFlatMap);
 		DUMPTOKEN(recruited.getShardState);
 		DUMPTOKEN(recruited.waitMetrics);
 		DUMPTOKEN(recruited.splitMetrics);
@@ -1093,9 +1118,10 @@ ACTOR Future<Void> storageServerRollbackRebooter(std::set<std::pair<UID, KeyValu
 		DUMPTOKEN(recruited.getKeyValueStoreType);
 		DUMPTOKEN(recruited.watchValue);
 		DUMPTOKEN(recruited.getKeyValuesStream);
+		DUMPTOKEN(recruited.getKeyValuesAndFlatMap);
 
 		prevStorageServer =
-		    storageServer(store, recruited, db, folder, Promise<Void>(), Reference<ClusterConnectionFile>(nullptr));
+		    storageServer(store, recruited, db, folder, Promise<Void>(), Reference<IClusterConnectionRecord>(nullptr));
 		prevStorageServer = handleIOErrors(prevStorageServer, store, id, store->onClosed());
 	}
 }
@@ -1308,7 +1334,28 @@ struct SharedLogsValue {
 	  : actor(actor), uid(uid), requests(requests) {}
 };
 
-ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
+ACTOR Future<Void> chaosMetricsLogger() {
+
+	auto res = g_network->global(INetwork::enChaosMetrics);
+	if (!res)
+		return Void();
+
+	state ChaosMetrics* chaosMetrics = static_cast<ChaosMetrics*>(res);
+	chaosMetrics->clear();
+
+	loop {
+		wait(delay(FLOW_KNOBS->CHAOS_LOGGING_INTERVAL));
+
+		TraceEvent e("ChaosMetrics");
+		double elapsed = now() - chaosMetrics->startTime;
+		e.detail("Elapsed", elapsed);
+		chaosMetrics->getFields(&e);
+		e.trackLatest("ChaosMetrics");
+		chaosMetrics->clear();
+	}
+}
+
+ACTOR Future<Void> workerServer(Reference<IClusterConnectionRecord> connRecord,
                                 Reference<AsyncVar<Optional<ClusterControllerFullInterface>> const> ccInterface,
                                 LocalityData locality,
                                 Reference<AsyncVar<ClusterControllerPriorityInfo>> asyncPriorityInfo,
@@ -1328,6 +1375,7 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 	state Reference<AsyncVar<Optional<DataDistributorInterface>>> ddInterf(
 	    new AsyncVar<Optional<DataDistributorInterface>>());
 	state Reference<AsyncVar<Optional<RatekeeperInterface>>> rkInterf(new AsyncVar<Optional<RatekeeperInterface>>());
+	state Reference<AsyncVar<Optional<BlobManagerInterface>>> bmInterf(new AsyncVar<Optional<BlobManagerInterface>>());
 	state Future<Void> handleErrors = workerHandleErrors(errors.getFuture()); // Needs to be stopped last
 	state ActorCollection errorForwarders(false);
 	state Future<Void> loggingTrigger = Void();
@@ -1336,6 +1384,7 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 	state Promise<Void> stopping;
 	state WorkerCache<InitializeStorageReply> storageCache;
 	state Future<Void> metricsLogger;
+	state Future<Void> chaosMetricsActor;
 	state Reference<AsyncVar<bool>> degraded = FlowTransport::transport().getDegraded();
 	// tLogFnForOptions() can return a function that doesn't correspond with the FDB version that the
 	// TLogVersion represents.  This can be done if the newer TLog doesn't support a requested option.
@@ -1353,6 +1402,11 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 	interf.initEndpoints();
 
 	state Reference<AsyncVar<std::set<std::string>>> issues(new AsyncVar<std::set<std::string>>());
+
+	if (FLOW_KNOBS->ENABLE_CHAOS_FEATURES) {
+		TraceEvent(SevInfo, "ChaosFeaturesEnabled");
+		chaosMetricsActor = chaosMetricsLogger();
+	}
 
 	folder = abspath(folder);
 
@@ -1383,7 +1437,7 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 	errorForwarders.add(loadedPonger(interf.debugPing.getFuture()));
 	errorForwarders.add(waitFailureServer(interf.waitFailure.getFuture()));
 	errorForwarders.add(monitorTraceLogIssues(issues));
-	errorForwarders.add(testerServerCore(interf.testerInterface, connFile, dbInfo, locality));
+	errorForwarders.add(testerServerCore(interf.testerInterface, connRecord, dbInfo, locality));
 	errorForwarders.add(monitorHighMemory(memoryProfileThreshold));
 
 	filesClosed.add(stopping.getFuture());
@@ -1462,9 +1516,10 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 				DUMPTOKEN(recruited.getKeyValueStoreType);
 				DUMPTOKEN(recruited.watchValue);
 				DUMPTOKEN(recruited.getKeyValuesStream);
+				DUMPTOKEN(recruited.getKeyValuesAndFlatMap);
 
 				Promise<Void> recovery;
-				Future<Void> f = storageServer(kv, recruited, dbInfo, folder, recovery, connFile);
+				Future<Void> f = storageServer(kv, recruited, dbInfo, folder, recovery, connRecord);
 				recoveries.push_back(recovery.getFuture());
 				f = handleIOErrors(f, kv, s.storeID, kvClosed);
 				f = storageServerRollbackRebooter(&runningStorages,
@@ -1558,6 +1613,7 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 			DUMPTOKEN(recruited.getValue);
 			DUMPTOKEN(recruited.getKey);
 			DUMPTOKEN(recruited.getKeyValues);
+			DUMPTOKEN(recruited.getKeyValuesAndFlatMap);
 			DUMPTOKEN(recruited.getShardState);
 			DUMPTOKEN(recruited.waitMetrics);
 			DUMPTOKEN(recruited.splitMetrics);
@@ -1589,10 +1645,12 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 		                                       initialClass,
 		                                       ddInterf,
 		                                       rkInterf,
+		                                       bmInterf,
 		                                       degraded,
-		                                       connFile,
+		                                       connRecord,
 		                                       issues,
-		                                       localConfig));
+		                                       localConfig,
+		                                       dbInfo));
 
 		if (configDBType != ConfigDBType::DISABLED) {
 			errorForwarders.add(localConfig->consume(interf.configBroadcastInterface));
@@ -1627,7 +1685,9 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 						    .detail("RatekeeperID",
 						            localInfo.ratekeeper.present() ? localInfo.ratekeeper.get().id() : UID())
 						    .detail("DataDistributorID",
-						            localInfo.distributor.present() ? localInfo.distributor.get().id() : UID());
+						            localInfo.distributor.present() ? localInfo.distributor.get().id() : UID())
+						    .detail("BlobManagerID",
+						            localInfo.blobManager.present() ? localInfo.blobManager.get().id() : UID());
 						dbInfo->set(localInfo);
 					}
 					errorForwarders.add(
@@ -1665,6 +1725,22 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 					flushAndExit(0);
 				}
 			}
+			when(SetFailureInjection req = waitNext(interf.clientInterface.setFailureInjection.getFuture())) {
+				if (FLOW_KNOBS->ENABLE_CHAOS_FEATURES) {
+					if (req.diskFailure.present()) {
+						auto diskFailureInjector = DiskFailureInjector::injector();
+						diskFailureInjector->setDiskFailure(req.diskFailure.get().stallInterval,
+						                                    req.diskFailure.get().stallPeriod,
+						                                    req.diskFailure.get().throttlePeriod);
+					} else if (req.flipBits.present()) {
+						auto bitFlipper = BitFlipper::flipper();
+						bitFlipper->setBitFlipPercentage(req.flipBits.get().percentBitFlips);
+					}
+					req.reply.send(Void());
+				} else {
+					req.reply.sendError(client_invalid_operation());
+				}
+			}
 			when(ProfilerRequest req = waitNext(interf.clientInterface.profiler.getFuture())) {
 				state ProfilerRequest profilerReq = req;
 				// There really isn't a great "filepath sanitizer" or "filepath escape" function available,
@@ -1696,16 +1772,14 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 				startRole(Role::MASTER, recruited.id(), interf.id());
 
 				DUMPTOKEN(recruited.waitFailure);
-				DUMPTOKEN(recruited.tlogRejoin);
-				DUMPTOKEN(recruited.changeCoordinators);
 				DUMPTOKEN(recruited.getCommitVersion);
 				DUMPTOKEN(recruited.getLiveCommittedVersion);
 				DUMPTOKEN(recruited.reportLiveCommittedVersion);
-				DUMPTOKEN(recruited.notifyBackupWorkerDone);
+				DUMPTOKEN(recruited.updateRecoveryData);
 
 				// printf("Recruited as masterServer\n");
 				Future<Void> masterProcess = masterServer(
-				    recruited, dbInfo, ccInterface, ServerCoordinators(connFile), req.lifetime, req.forceRecovery);
+				    recruited, dbInfo, ccInterface, ServerCoordinators(connRecord), req.lifetime, req.forceRecovery);
 				errorForwarders.add(
 				    zombie(recruited, forwardError(errors, Role::MASTER, recruited.id(), masterProcess)));
 				req.reply.send(recruited);
@@ -1759,6 +1833,31 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 					rkInterf->set(Optional<RatekeeperInterface>(recruited));
 				}
 				TraceEvent("Ratekeeper_InitRequest", req.reqId).detail("RatekeeperId", recruited.id());
+				req.reply.send(recruited);
+			}
+			when(InitializeBlobManagerRequest req = waitNext(interf.blobManager.getFuture())) {
+				LocalLineage _;
+				getCurrentLineage()->modify(&RoleLineage::role) = ProcessClass::ClusterRole::BlobManager;
+				BlobManagerInterface recruited(locality, req.reqId);
+				recruited.initEndpoints();
+
+				if (bmInterf->get().present()) {
+					recruited = bmInterf->get().get();
+					TEST(true); // Recruited while already a blob manager.
+				} else {
+					startRole(Role::BLOB_MANAGER, recruited.id(), interf.id());
+					DUMPTOKEN(recruited.waitFailure);
+					DUMPTOKEN(recruited.haltBlobManager);
+
+					Future<Void> blobManagerProcess = blobManager(recruited, dbInfo, req.epoch);
+					errorForwarders.add(forwardError(
+					    errors,
+					    Role::BLOB_MANAGER,
+					    recruited.id(),
+					    setWhenDoneOrError(blobManagerProcess, bmInterf, Optional<BlobManagerInterface>())));
+					bmInterf->set(Optional<BlobManagerInterface>(recruited));
+				}
+				TraceEvent("BlobManagerReceived", req.reqId).detail("BlobManagerId", recruited.id());
 				req.reply.send(recruited);
 			}
 			when(InitializeBackupRequest req = waitNext(interf.backup.getFuture())) {
@@ -1859,6 +1958,7 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 				                 runningStorages.end(),
 				                 [&req](const auto& p) { return p.second != req.storeType; }) ||
 				     req.seedTag != invalidTag)) {
+					ASSERT(req.clusterId.isValid());
 					LocalLineage _;
 					getCurrentLineage()->modify(&RoleLineage::role) = ProcessClass::ClusterRole::Storage;
 					bool isTss = req.tssPairIDAndVersion.present();
@@ -1887,6 +1987,7 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 					DUMPTOKEN(recruited.getKeyValueStoreType);
 					DUMPTOKEN(recruited.watchValue);
 					DUMPTOKEN(recruited.getKeyValuesStream);
+					DUMPTOKEN(recruited.getKeyValuesAndFlatMap);
 					// printf("Recruited as storageServer\n");
 
 					std::string filename =
@@ -1902,6 +2003,7 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 					Future<Void> s = storageServer(data,
 					                               recruited,
 					                               req.seedTag,
+					                               req.clusterId,
 					                               isTss ? req.tssPairIDAndVersion.get().second : 0,
 					                               storageReady,
 					                               dbInfo,
@@ -1924,12 +2026,21 @@ ACTOR Future<Void> workerServer(Reference<ClusterConnectionFile> connFile,
 				} else if (storageCache.exists(req.reqId)) {
 					forwardPromise(req.reply, storageCache.get(req.reqId));
 				} else {
-					TraceEvent("AttemptedDoubleRecruitement", interf.id()).detail("ForRole", "StorageServer");
+					TraceEvent("AttemptedDoubleRecruitment", interf.id()).detail("ForRole", "StorageServer");
 					errorForwarders.add(map(delay(0.5), [reply = req.reply](Void) {
 						reply.sendError(recruitment_failed());
 						return Void();
 					}));
 				}
+			}
+			when(InitializeBlobWorkerRequest req = waitNext(interf.blobWorker.getFuture())) {
+				BlobWorkerInterface recruited(locality, req.interfaceId);
+				recruited.initEndpoints();
+				startRole(Role::BLOB_WORKER, recruited.id(), interf.id());
+
+				ReplyPromise<InitializeBlobWorkerReply> blobWorkerReady = req.reply;
+				Future<Void> bw = blobWorker(recruited, blobWorkerReady, dbInfo);
+				errorForwarders.add(forwardError(errors, Role::BLOB_WORKER, recruited.id(), bw));
 			}
 			when(InitializeCommitProxyRequest req = waitNext(interf.commitProxy.getFuture())) {
 				LocalLineage _;
@@ -2293,10 +2404,10 @@ ACTOR Future<UID> createAndLockProcessIdFile(std::string folder) {
 }
 
 ACTOR Future<MonitorLeaderInfo> monitorLeaderWithDelayedCandidacyImplOneGeneration(
-    Reference<ClusterConnectionFile> connFile,
+    Reference<IClusterConnectionRecord> connRecord,
     Reference<AsyncVar<Value>> result,
     MonitorLeaderInfo info) {
-	state ClusterConnectionString ccf = info.intermediateConnFile->getConnectionString();
+	state ClusterConnectionString ccf = info.intermediateConnRecord->getConnectionString();
 	state std::vector<NetworkAddress> addrs = ccf.coordinators();
 	state ElectionResultRequest request;
 	state int index = 0;
@@ -2314,24 +2425,24 @@ ACTOR Future<MonitorLeaderInfo> monitorLeaderWithDelayedCandidacyImplOneGenerati
 		if (leader.present()) {
 			if (leader.get().present()) {
 				if (leader.get().get().forward) {
-					info.intermediateConnFile = makeReference<ClusterConnectionFile>(
-					    connFile->getFilename(), ClusterConnectionString(leader.get().get().serializedInfo.toString()));
+					info.intermediateConnRecord = connRecord->makeIntermediateRecord(
+					    ClusterConnectionString(leader.get().get().serializedInfo.toString()));
 					return info;
 				}
-				if (connFile != info.intermediateConnFile) {
+				if (connRecord != info.intermediateConnRecord) {
 					if (!info.hasConnected) {
 						TraceEvent(SevWarnAlways, "IncorrectClusterFileContentsAtConnection")
-						    .detail("Filename", connFile->getFilename())
-						    .detail("ConnectionStringFromFile", connFile->getConnectionString().toString())
+						    .detail("ClusterFile", connRecord->toString())
+						    .detail("StoredConnectionString", connRecord->getConnectionString().toString())
 						    .detail("CurrentConnectionString",
-						            info.intermediateConnFile->getConnectionString().toString());
+						            info.intermediateConnRecord->getConnectionString().toString());
 					}
-					connFile->setConnectionString(info.intermediateConnFile->getConnectionString());
-					info.intermediateConnFile = connFile;
+					connRecord->setConnectionString(info.intermediateConnRecord->getConnectionString());
+					info.intermediateConnRecord = connRecord;
 				}
 
 				info.hasConnected = true;
-				connFile->notifyConnected();
+				connRecord->notifyConnected();
 				request.knownLeader = leader.get().get().changeID;
 
 				ClusterControllerPriorityInfo info = leader.get().get().getPriorityInfo();
@@ -2354,35 +2465,35 @@ ACTOR Future<MonitorLeaderInfo> monitorLeaderWithDelayedCandidacyImplOneGenerati
 	}
 }
 
-ACTOR Future<Void> monitorLeaderWithDelayedCandidacyImplInternal(Reference<ClusterConnectionFile> connFile,
+ACTOR Future<Void> monitorLeaderWithDelayedCandidacyImplInternal(Reference<IClusterConnectionRecord> connRecord,
                                                                  Reference<AsyncVar<Value>> outSerializedLeaderInfo) {
-	state MonitorLeaderInfo info(connFile);
+	state MonitorLeaderInfo info(connRecord);
 	loop {
 		MonitorLeaderInfo _info =
-		    wait(monitorLeaderWithDelayedCandidacyImplOneGeneration(connFile, outSerializedLeaderInfo, info));
+		    wait(monitorLeaderWithDelayedCandidacyImplOneGeneration(connRecord, outSerializedLeaderInfo, info));
 		info = _info;
 	}
 }
 
 template <class LeaderInterface>
 Future<Void> monitorLeaderWithDelayedCandidacyImpl(
-    Reference<ClusterConnectionFile> const& connFile,
+    Reference<IClusterConnectionRecord> const& connRecord,
     Reference<AsyncVar<Optional<LeaderInterface>>> const& outKnownLeader) {
 	LeaderDeserializer<LeaderInterface> deserializer;
 	auto serializedInfo = makeReference<AsyncVar<Value>>();
-	Future<Void> m = monitorLeaderWithDelayedCandidacyImplInternal(connFile, serializedInfo);
+	Future<Void> m = monitorLeaderWithDelayedCandidacyImplInternal(connRecord, serializedInfo);
 	return m || deserializer(serializedInfo, outKnownLeader);
 }
 
 ACTOR Future<Void> monitorLeaderWithDelayedCandidacy(
-    Reference<ClusterConnectionFile> connFile,
+    Reference<IClusterConnectionRecord> connRecord,
     Reference<AsyncVar<Optional<ClusterControllerFullInterface>>> currentCC,
     Reference<AsyncVar<ClusterControllerPriorityInfo>> asyncPriorityInfo,
     Future<Void> recoveredDiskFiles,
     LocalityData locality,
     Reference<AsyncVar<ServerDBInfo>> dbInfo,
     ConfigDBType configDBType) {
-	state Future<Void> monitor = monitorLeaderWithDelayedCandidacyImpl(connFile, currentCC);
+	state Future<Void> monitor = monitorLeaderWithDelayedCandidacyImpl(connRecord, currentCC);
 	state Future<Void> timeout;
 
 	wait(recoveredDiskFiles);
@@ -2408,7 +2519,7 @@ ACTOR Future<Void> monitorLeaderWithDelayedCandidacy(
 			when(wait(timeout.isValid() ? timeout : Never())) {
 				monitor.cancel();
 				wait(clusterController(
-				    connFile, currentCC, asyncPriorityInfo, recoveredDiskFiles, locality, configDBType));
+				    connRecord, currentCC, asyncPriorityInfo, recoveredDiskFiles, locality, configDBType));
 				return Void();
 			}
 		}
@@ -2458,7 +2569,7 @@ ACTOR Future<Void> serveProcess() {
 	}
 }
 
-ACTOR Future<Void> fdbd(Reference<ClusterConnectionFile> connFile,
+ACTOR Future<Void> fdbd(Reference<IClusterConnectionRecord> connRecord,
                         LocalityData localities,
                         ProcessClass processClass,
                         std::string dataFolder,
@@ -2489,7 +2600,7 @@ ACTOR Future<Void> fdbd(Reference<ClusterConnectionFile> connFile,
 	actors.push_back(serveProcess());
 
 	try {
-		ServerCoordinators coordinators(connFile);
+		ServerCoordinators coordinators(connRecord);
 		if (g_network->isSimulated()) {
 			whitelistBinPaths = ",, random_path,  /bin/snap_create.sh,,";
 		}
@@ -2506,7 +2617,7 @@ ACTOR Future<Void> fdbd(Reference<ClusterConnectionFile> connFile,
 		if (coordFolder.size()) {
 			// SOMEDAY: remove the fileNotFound wrapper and make DiskQueue construction safe from errors setting up
 			// their files
-			actors.push_back(fileNotFoundToNever(coordinationServer(coordFolder, coordinators.ccf, configDBType)));
+			actors.push_back(fileNotFoundToNever(coordinationServer(coordFolder, coordinators.ccr, configDBType)));
 		}
 
 		state UID processIDUid = wait(createAndLockProcessIdFile(dataFolder));
@@ -2523,21 +2634,25 @@ ACTOR Future<Void> fdbd(Reference<ClusterConnectionFile> connFile,
 		actors.push_back(reportErrors(monitorAndWriteCCPriorityInfo(fitnessFilePath, asyncPriorityInfo),
 		                              "MonitorAndWriteCCPriorityInfo"));
 		if (processClass.machineClassFitness(ProcessClass::ClusterController) == ProcessClass::NeverAssign) {
-			actors.push_back(reportErrors(monitorLeader(connFile, cc), "ClusterController"));
+			actors.push_back(reportErrors(monitorLeader(connRecord, cc), "ClusterController"));
 		} else if (processClass.machineClassFitness(ProcessClass::ClusterController) == ProcessClass::WorstFit &&
 		           SERVER_KNOBS->MAX_DELAY_CC_WORST_FIT_CANDIDACY_SECONDS > 0) {
-			actors.push_back(reportErrors(
-			    monitorLeaderWithDelayedCandidacy(
-			        connFile, cc, asyncPriorityInfo, recoveredDiskFiles.getFuture(), localities, dbInfo, configDBType),
-			    "ClusterController"));
+			actors.push_back(reportErrors(monitorLeaderWithDelayedCandidacy(connRecord,
+			                                                                cc,
+			                                                                asyncPriorityInfo,
+			                                                                recoveredDiskFiles.getFuture(),
+			                                                                localities,
+			                                                                dbInfo,
+			                                                                configDBType),
+			                              "ClusterController"));
 		} else {
 			actors.push_back(reportErrors(
 			    clusterController(
-			        connFile, cc, asyncPriorityInfo, recoveredDiskFiles.getFuture(), localities, configDBType),
+			        connRecord, cc, asyncPriorityInfo, recoveredDiskFiles.getFuture(), localities, configDBType),
 			    "ClusterController"));
 		}
 		actors.push_back(reportErrors(extractClusterInterface(cc, ci), "ExtractClusterInterface"));
-		actors.push_back(reportErrorsExcept(workerServer(connFile,
+		actors.push_back(reportErrorsExcept(workerServer(connRecord,
 		                                                 cc,
 		                                                 localities,
 		                                                 asyncPriorityInfo,
@@ -2585,6 +2700,8 @@ const Role Role::TESTER("Tester", "TS");
 const Role Role::LOG_ROUTER("LogRouter", "LR");
 const Role Role::DATA_DISTRIBUTOR("DataDistributor", "DD");
 const Role Role::RATEKEEPER("Ratekeeper", "RK");
+const Role Role::BLOB_MANAGER("BlobManager", "BM");
+const Role Role::BLOB_WORKER("BlobWorker", "BW");
 const Role Role::STORAGE_CACHE("StorageCache", "SC");
 const Role Role::COORDINATOR("Coordinator", "CD");
 const Role Role::BACKUP("Backup", "BK");

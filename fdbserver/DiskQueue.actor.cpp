@@ -869,7 +869,7 @@ public:
 	}
 };
 
-class DiskQueue : public IDiskQueue, public Tracked<DiskQueue> {
+class DiskQueue final : public IDiskQueue, public Tracked<DiskQueue> {
 public:
 	// FIXME: Is setting lastCommittedSeq to -1 instead of 0 necessary?
 	DiskQueue(std::string basename,
@@ -999,8 +999,8 @@ public:
 		return endLocation();
 	}
 
-	Future<Void> getError() override { return rawQueue->getError(); }
-	Future<Void> onClosed() override { return rawQueue->onClosed(); }
+	Future<Void> getError() const override { return rawQueue->getError(); }
+	Future<Void> onClosed() const override { return rawQueue->onClosed(); }
 
 	void dispose() override {
 		TraceEvent("DQDestroy", dbgid)
@@ -1539,7 +1539,7 @@ private:
 // This works by performing two commits when uncommitted data is popped:
 //	Commit 1 - pop only previously committed data and push new data (i.e., commit uncommitted data)
 //  Commit 2 - finish pop into uncommitted data
-class DiskQueue_PopUncommitted : public IDiskQueue {
+class DiskQueue_PopUncommitted final : public IDiskQueue {
 
 public:
 	DiskQueue_PopUncommitted(std::string basename,
@@ -1551,8 +1551,8 @@ public:
 	    popped(0), committed(0){};
 
 	// IClosable
-	Future<Void> getError() override { return queue->getError(); }
-	Future<Void> onClosed() override { return queue->onClosed(); }
+	Future<Void> getError() const override { return queue->getError(); }
+	Future<Void> onClosed() const override { return queue->onClosed(); }
 	void dispose() override {
 		queue->dispose();
 		delete this;

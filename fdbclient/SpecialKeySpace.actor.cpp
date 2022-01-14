@@ -27,6 +27,7 @@
 #include <exception>
 
 #include "fdbclient/ActorLineageProfiler.h"
+#include "fdbclient/ClusterConnectionMemoryRecord.h"
 #include "fdbclient/Knobs.h"
 #include "fdbclient/ProcessInterface.h"
 #include "fdbclient/GlobalConfig.actor.h"
@@ -652,8 +653,8 @@ ConflictingKeysImpl::ConflictingKeysImpl(KeyRangeRef kr) : SpecialKeyRangeReadIm
 
 Future<RangeResult> ConflictingKeysImpl::getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr) const {
 	RangeResult result;
-	if (ryw->getTransactionInfo().conflictingKeys) {
-		auto krMapPtr = ryw->getTransactionInfo().conflictingKeys.get();
+	if (ryw->getTransactionState()->conflictingKeys) {
+		auto krMapPtr = ryw->getTransactionState()->conflictingKeys.get();
 		auto beginIter = krMapPtr->rangeContaining(kr.begin);
 		if (beginIter->begin() != kr.begin)
 			++beginIter;
@@ -1538,10 +1539,10 @@ Future<RangeResult> TracingOptionsImpl::getRange(ReadYourWritesTransaction* ryw,
 
 		if (key.endsWith(kTracingTransactionIdKey)) {
 			result.push_back_deep(result.arena(),
-			                      KeyValueRef(key, std::to_string(ryw->getTransactionInfo().spanID.first())));
+			                      KeyValueRef(key, std::to_string(ryw->getTransactionState()->spanID.first())));
 		} else if (key.endsWith(kTracingTokenKey)) {
 			result.push_back_deep(result.arena(),
-			                      KeyValueRef(key, std::to_string(ryw->getTransactionInfo().spanID.second())));
+			                      KeyValueRef(key, std::to_string(ryw->getTransactionState()->spanID.second())));
 		}
 	}
 	return result;
@@ -1590,8 +1591,7 @@ CoordinatorsImpl::CoordinatorsImpl(KeyRangeRef kr) : SpecialKeyRangeRWImpl(kr) {
 Future<RangeResult> CoordinatorsImpl::getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr) const {
 	RangeResult result;
 	KeyRef prefix(getKeyRange().begin);
-	// the constructor of ClusterConnectionFile already checks whether the file is valid
-	auto cs = ClusterConnectionFile(ryw->getDatabase()->getConnectionFile()->getFilename()).getConnectionString();
+	auto cs = ryw->getDatabase()->getConnectionRecord()->getConnectionString();
 	auto coordinator_processes = cs.coordinators();
 	Key cluster_decription_key = prefix.withSuffix(LiteralStringRef("cluster_description"));
 	if (kr.contains(cluster_decription_key)) {
@@ -1737,7 +1737,10 @@ ACTOR static Future<RangeResult> CoordinatorsAutoImplActor(ReadYourWritesTransac
 	state CoordinatorsResult result = CoordinatorsResult::SUCCESS;
 
 	std::vector<NetworkAddress> _desiredCoordinators = wait(autoQuorumChange()->getDesiredCoordinators(
-	    &tr, old.coordinators(), Reference<ClusterConnectionFile>(new ClusterConnectionFile(old)), result));
+	    &tr,
+	    old.coordinators(),
+	    Reference<ClusterConnectionMemoryRecord>(new ClusterConnectionMemoryRecord(old)),
+	    result));
 
 	if (result == CoordinatorsResult::NOT_ENOUGH_MACHINES) {
 		// we could get not_enough_machines if we happen to see the database while the cluster controller is updating
@@ -1958,7 +1961,7 @@ void parse(StringRef& val, WaitState& w) {
 }
 
 void parse(StringRef& val, time_t& t) {
-	struct tm tm = { 0 };
+	struct tm tm;
 #ifdef _WIN32
 	std::istringstream s(val.toString());
 	s.imbue(std::locale(setlocale(LC_TIME, nullptr)));

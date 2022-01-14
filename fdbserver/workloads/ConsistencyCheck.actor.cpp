@@ -295,6 +295,13 @@ struct ConsistencyCheckWorkload : TestWorkload {
 					wait(::success(self->checkForStorage(cx, configuration, tssMapping, self)));
 					wait(::success(self->checkForExtraDataStores(cx, self)));
 
+					// Check blob workers are operating as expected
+					if (CLIENT_KNOBS->ENABLE_BLOB_GRANULES) {
+						bool blobWorkersCorrect = wait(self->checkBlobWorkers(cx, configuration, self));
+						if (!blobWorkersCorrect)
+							self->testFailure("Blob workers incorrect");
+					}
+
 					// Check that each machine is operating as its desired class
 					bool usingDesiredClasses = wait(self->checkUsingDesiredClasses(cx, self));
 					if (!usingDesiredClasses)
@@ -870,7 +877,8 @@ struct ConsistencyCheckWorkload : TestWorkload {
 		state Span span(deterministicRandom()->randomUniqueID(), "WL:ConsistencyCheck"_loc);
 
 		while (begin < end) {
-			state Reference<CommitProxyInfo> commitProxyInfo = wait(cx->getCommitProxiesFuture(false));
+			state Reference<CommitProxyInfo> commitProxyInfo =
+			    wait(cx->getCommitProxiesFuture(UseProvisionalProxies::False));
 			keyServerLocationFutures.clear();
 			for (int i = 0; i < commitProxyInfo->size(); i++)
 				keyServerLocationFutures.push_back(
@@ -1117,7 +1125,7 @@ struct ConsistencyCheckWorkload : TestWorkload {
 		loop {
 			try {
 				StorageMetrics metrics =
-				    wait(tr.getStorageMetrics(KeyRangeRef(allKeys.begin, keyServersPrefix), 100000));
+				    wait(tr.getDatabase()->getStorageMetrics(KeyRangeRef(allKeys.begin, keyServersPrefix), 100000));
 				return metrics.bytes;
 			} catch (Error& e) {
 				wait(tr.onError(e));
@@ -1591,7 +1599,8 @@ struct ConsistencyCheckWorkload : TestWorkload {
 					for (int j = 0; j < storageServers.size(); j++)
 						storageServerSizes[storageServers[j]] += shardBytes;
 
-				bool hasValidEstimate = estimatedBytes.size() > 0;
+				// FIXME: Where is this intended to be used?
+				[[maybe_unused]] bool hasValidEstimate = estimatedBytes.size() > 0;
 
 				// If the storage servers' sampled estimate of shard size is different from ours
 				if (self->performQuiescentChecks) {
@@ -1946,6 +1955,80 @@ struct ConsistencyCheckWorkload : TestWorkload {
 		return true;
 	}
 
+	// Checks if the blob workers are "correct".
+	// Returns false if ANY of the following
+	// - any blob worker is on a diff DC than the blob manager/CC, or
+	// - any worker that should have a blob worker does not have exactly one, or
+	// - any worker that should NOT have a blob worker does indeed have one
+	ACTOR Future<bool> checkBlobWorkers(Database cx,
+	                                    DatabaseConfiguration configuration,
+	                                    ConsistencyCheckWorkload* self) {
+		state std::vector<BlobWorkerInterface> blobWorkers = wait(getBlobWorkers(cx));
+		state std::vector<WorkerDetails> workers = wait(getWorkers(self->dbInfo));
+
+		// process addr -> num blob workers on that process
+		state std::unordered_map<NetworkAddress, int> blobWorkersByAddr;
+		Optional<Key> ccDcId;
+		NetworkAddress ccAddr = self->dbInfo->get().clusterInterface.clientInterface.address();
+
+		// get the CC's DCID
+		for (const auto& worker : workers) {
+			if (ccAddr == worker.interf.address()) {
+				ccDcId = worker.interf.locality.dcId();
+				break;
+			}
+		}
+
+		if (!ccDcId.present()) {
+			TraceEvent("ConsistencyCheck_DidNotFindCC");
+			return false;
+		}
+
+		for (const auto& bwi : blobWorkers) {
+			if (bwi.locality.dcId() != ccDcId) {
+				TraceEvent("ConsistencyCheck_BWOnDiffDcThanCC")
+				    .detail("BWID", bwi.id())
+				    .detail("BwDcId", bwi.locality.dcId())
+				    .detail("CcDcId", ccDcId);
+				return false;
+			}
+			blobWorkersByAddr[bwi.stableAddress()]++;
+		}
+
+		int numBlobWorkerProcesses = 0;
+		for (const auto& worker : workers) {
+			NetworkAddress addr = worker.interf.stableAddress();
+			if (!configuration.isExcludedServer(worker.interf.addresses())) {
+				if (worker.processClass == ProcessClass::BlobWorkerClass) {
+					numBlobWorkerProcesses++;
+
+					// this is a worker with processClass == BWClass, so should have exactly one blob worker
+					if (blobWorkersByAddr[addr] == 0) {
+						TraceEvent("ConsistencyCheck_NoBWsOnBWClass")
+						    .detail("Address", addr)
+						    .detail("NumBlobWorkersOnAddr", blobWorkersByAddr[addr]);
+						return false;
+					}
+					/* TODO: replace above code with this once blob manager recovery is handled
+					if (blobWorkersByAddr[addr] != 1) {
+					    TraceEvent("ConsistencyCheck_NoBWOrManyBWsOnBWClass")
+					        .detail("Address", addr)
+					        .detail("NumBlobWorkersOnAddr", blobWorkersByAddr[addr]);
+					    return false;
+					}
+					*/
+				} else {
+					// this is a worker with processClass != BWClass, so there should be no BWs on it
+					if (blobWorkersByAddr[addr] > 0) {
+						TraceEvent("ConsistencyCheck_BWOnNonBWClass").detail("Address", addr);
+						return false;
+					}
+				}
+			}
+		}
+		return numBlobWorkerProcesses > 0;
+	}
+
 	ACTOR Future<bool> checkWorkerList(Database cx, ConsistencyCheckWorkload* self) {
 		if (g_simulator.extraDB)
 			return true;
@@ -2266,6 +2349,22 @@ struct ConsistencyCheckWorkload : TestWorkload {
 			        nonExcludedWorkerProcessMap.count(db.ratekeeper.get().address())
 			            ? nonExcludedWorkerProcessMap[db.ratekeeper.get().address()].processClass.machineClassFitness(
 			                  ProcessClass::Ratekeeper)
+			            : -1);
+			return false;
+		}
+
+		// Check BlobManager
+		if (CLIENT_KNOBS->ENABLE_BLOB_GRANULES && db.blobManager.present() &&
+		    (!nonExcludedWorkerProcessMap.count(db.blobManager.get().address()) ||
+		     nonExcludedWorkerProcessMap[db.blobManager.get().address()].processClass.machineClassFitness(
+		         ProcessClass::BlobManager) > fitnessLowerBound)) {
+			TraceEvent("ConsistencyCheck_BlobManagerNotBest")
+			    .detail("BestBlobManagerFitness", fitnessLowerBound)
+			    .detail(
+			        "ExistingBlobManagerFitness",
+			        nonExcludedWorkerProcessMap.count(db.blobManager.get().address())
+			            ? nonExcludedWorkerProcessMap[db.blobManager.get().address()].processClass.machineClassFitness(
+			                  ProcessClass::BlobManager)
 			            : -1);
 			return false;
 		}

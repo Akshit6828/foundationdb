@@ -57,7 +57,7 @@ struct WorkloadContext {
 	WorkloadContext& operator=(const WorkloadContext&) = delete;
 };
 
-struct TestWorkload : NonCopyable, WorkloadContext {
+struct TestWorkload : NonCopyable, WorkloadContext, ReferenceCounted<TestWorkload> {
 	int phases;
 
 	// Subclasses are expected to also have a constructor with this signature (to work with WorkloadFactory<>):
@@ -103,25 +103,26 @@ struct KVWorkload : TestWorkload {
 	Key keyForIndex(uint64_t index, bool absent) const;
 };
 
-struct IWorkloadFactory {
-	static TestWorkload* create(std::string const& name, WorkloadContext const& wcx) {
+struct IWorkloadFactory : ReferenceCounted<IWorkloadFactory> {
+	static Reference<TestWorkload> create(std::string const& name, WorkloadContext const& wcx) {
 		auto it = factories().find(name);
 		if (it == factories().end())
-			return nullptr; // or throw?
+			return {}; // or throw?
 		return it->second->create(wcx);
 	}
-	static std::map<std::string, IWorkloadFactory*>& factories() {
-		static std::map<std::string, IWorkloadFactory*> theFactories;
+	static std::map<std::string, Reference<IWorkloadFactory>>& factories() {
+		static std::map<std::string, Reference<IWorkloadFactory>> theFactories;
 		return theFactories;
 	}
 
-	virtual TestWorkload* create(WorkloadContext const& wcx) = 0;
+	virtual ~IWorkloadFactory() = default;
+	virtual Reference<TestWorkload> create(WorkloadContext const& wcx) = 0;
 };
 
 template <class WorkloadType>
 struct WorkloadFactory : IWorkloadFactory {
-	WorkloadFactory(const char* name) { factories()[name] = this; }
-	TestWorkload* create(WorkloadContext const& wcx) override { return new WorkloadType(wcx); }
+	WorkloadFactory(const char* name) { factories()[name] = Reference<IWorkloadFactory>::addRef(this); }
+	Reference<TestWorkload> create(WorkloadContext const& wcx) override { return makeReference<WorkloadType>(wcx); }
 };
 
 #define REGISTER_WORKLOAD(classname) WorkloadFactory<classname> classname##WorkloadFactory(#classname)
@@ -229,6 +230,24 @@ Future<Void> quietDatabase(Database const& cx,
                            int64_t maxStorageServerQueueGate = 5e6,
                            int64_t maxDataDistributionQueueSize = 0,
                            int64_t maxPoppedVersionLag = 30e6);
+
+/**
+ * A utility function for testing error situations. It succeeds if the given test
+ * throws an error. If expectedError is provided, it additionally checks if the
+ * error code is as expected.
+ *
+ * In case of a failure, logs an corresponding error in the trace with the given
+ * description and details, sets the given success flag to false (optional)
+ * and throws the given exception (optional). Note that in case of a successful
+ * test execution, the success flag is kept unchanged.
+ */
+Future<Void> testExpectedError(Future<Void> test,
+                               const char* testDescr,
+                               Optional<Error> expectedError = Optional<Error>(),
+                               Optional<bool*> successFlag = Optional<bool*>(),
+                               std::map<std::string, std::string> details = {},
+                               Optional<Error> throwOnError = Optional<Error>(),
+                               UID id = UID());
 
 #include "flow/unactorcompiler.h"
 

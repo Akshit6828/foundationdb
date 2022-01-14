@@ -30,7 +30,9 @@
 #include "fdbserver/MasterInterface.h"
 #include "fdbserver/TLogInterface.h"
 #include "fdbserver/RatekeeperInterface.h"
+#include "fdbserver/BlobManagerInterface.h"
 #include "fdbserver/ResolverInterface.h"
+#include "fdbclient/BlobWorkerInterface.h"
 #include "fdbclient/ClientBooleanParams.h"
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbserver/TesterInterface.actor.h"
@@ -52,6 +54,8 @@ struct WorkerInterface {
 	RequestStream<struct InitializeGrvProxyRequest> grvProxy;
 	RequestStream<struct InitializeDataDistributorRequest> dataDistributor;
 	RequestStream<struct InitializeRatekeeperRequest> ratekeeper;
+	RequestStream<struct InitializeBlobManagerRequest> blobManager;
+	RequestStream<struct InitializeBlobWorkerRequest> blobWorker;
 	RequestStream<struct InitializeResolverRequest> resolver;
 	RequestStream<struct InitializeStorageRequest> storage;
 	RequestStream<struct InitializeLogRouterRequest> logRouter;
@@ -105,6 +109,8 @@ struct WorkerInterface {
 		           grvProxy,
 		           dataDistributor,
 		           ratekeeper,
+		           blobManager,
+		           blobWorker,
 		           resolver,
 		           storage,
 		           logRouter,
@@ -150,23 +156,32 @@ struct ClusterControllerFullInterface {
 	RequestStream<struct RecruitFromConfigurationRequest> recruitFromConfiguration;
 	RequestStream<struct RecruitRemoteFromConfigurationRequest> recruitRemoteFromConfiguration;
 	RequestStream<struct RecruitStorageRequest> recruitStorage;
+	RequestStream<struct RecruitBlobWorkerRequest> recruitBlobWorker;
 	RequestStream<struct RegisterWorkerRequest> registerWorker;
 	RequestStream<struct GetWorkersRequest> getWorkers;
 	RequestStream<struct RegisterMasterRequest> registerMaster;
 	RequestStream<struct GetServerDBInfoRequest>
 	    getServerDBInfo; // only used by testers; the cluster controller will send the serverDBInfo to workers
 	RequestStream<struct UpdateWorkerHealthRequest> updateWorkerHealth;
+	RequestStream<struct TLogRejoinRequest>
+	    tlogRejoin; // sent by tlog (whether or not rebooted) to communicate with a new controller
+	RequestStream<struct BackupWorkerDoneRequest> notifyBackupWorkerDone;
+	RequestStream<struct ChangeCoordinatorsRequest> changeCoordinators;
 
 	UID id() const { return clientInterface.id(); }
 	bool operator==(ClusterControllerFullInterface const& r) const { return id() == r.id(); }
 	bool operator!=(ClusterControllerFullInterface const& r) const { return id() != r.id(); }
 
+	NetworkAddress address() const { return clientInterface.address(); }
+
 	bool hasMessage() const {
 		return clientInterface.hasMessage() || recruitFromConfiguration.getFuture().isReady() ||
 		       recruitRemoteFromConfiguration.getFuture().isReady() || recruitStorage.getFuture().isReady() ||
-		       registerWorker.getFuture().isReady() || getWorkers.getFuture().isReady() ||
-		       registerMaster.getFuture().isReady() || getServerDBInfo.getFuture().isReady() ||
-		       updateWorkerHealth.getFuture().isReady();
+		       recruitBlobWorker.getFuture().isReady() || registerWorker.getFuture().isReady() ||
+		       getWorkers.getFuture().isReady() || registerMaster.getFuture().isReady() ||
+		       getServerDBInfo.getFuture().isReady() || updateWorkerHealth.getFuture().isReady() ||
+		       tlogRejoin.getFuture().isReady() || notifyBackupWorkerDone.getFuture().isReady() ||
+		       changeCoordinators.getFuture().isReady();
 	}
 
 	void initEndpoints() {
@@ -174,11 +189,15 @@ struct ClusterControllerFullInterface {
 		recruitFromConfiguration.getEndpoint(TaskPriority::ClusterControllerRecruit);
 		recruitRemoteFromConfiguration.getEndpoint(TaskPriority::ClusterControllerRecruit);
 		recruitStorage.getEndpoint(TaskPriority::ClusterController);
+		recruitBlobWorker.getEndpoint(TaskPriority::ClusterController);
 		registerWorker.getEndpoint(TaskPriority::ClusterControllerWorker);
 		getWorkers.getEndpoint(TaskPriority::ClusterController);
 		registerMaster.getEndpoint(TaskPriority::ClusterControllerRegister);
 		getServerDBInfo.getEndpoint(TaskPriority::ClusterController);
 		updateWorkerHealth.getEndpoint(TaskPriority::ClusterController);
+		tlogRejoin.getEndpoint(TaskPriority::MasterTLogRejoin);
+		notifyBackupWorkerDone.getEndpoint(TaskPriority::ClusterController);
+		changeCoordinators.getEndpoint(TaskPriority::DefaultEndpoint);
 	}
 
 	template <class Ar>
@@ -191,11 +210,15 @@ struct ClusterControllerFullInterface {
 		           recruitFromConfiguration,
 		           recruitRemoteFromConfiguration,
 		           recruitStorage,
+		           recruitBlobWorker,
 		           registerWorker,
 		           getWorkers,
 		           registerMaster,
 		           getServerDBInfo,
-		           updateWorkerHealth);
+		           updateWorkerHealth,
+		           tlogRejoin,
+		           notifyBackupWorkerDone,
+		           changeCoordinators);
 	}
 };
 
@@ -229,6 +252,7 @@ struct RegisterMasterRequest {
 	std::vector<UID> priorCommittedLogServers;
 	RecoveryState recoveryState;
 	bool recoveryStalled;
+	UID clusterId;
 
 	ReplyPromise<Void> reply;
 
@@ -252,6 +276,7 @@ struct RegisterMasterRequest {
 		           priorCommittedLogServers,
 		           recoveryState,
 		           recoveryStalled,
+		           clusterId,
 		           reply);
 	}
 };
@@ -312,10 +337,11 @@ struct RecruitRemoteFromConfigurationReply {
 	constexpr static FileIdentifier file_identifier = 9091392;
 	std::vector<WorkerInterface> remoteTLogs;
 	std::vector<WorkerInterface> logRouters;
+	Optional<UID> dbgId;
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, remoteTLogs, logRouters);
+		serializer(ar, remoteTLogs, logRouters, dbgId);
 	}
 };
 
@@ -325,6 +351,7 @@ struct RecruitRemoteFromConfigurationRequest {
 	Optional<Key> dcId;
 	int logRouterCount;
 	std::vector<UID> exclusionWorkerIds;
+	Optional<UID> dbgId;
 	ReplyPromise<RecruitRemoteFromConfigurationReply> reply;
 
 	RecruitRemoteFromConfigurationRequest() {}
@@ -337,7 +364,7 @@ struct RecruitRemoteFromConfigurationRequest {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, configuration, dcId, logRouterCount, exclusionWorkerIds, reply);
+		serializer(ar, configuration, dcId, logRouterCount, exclusionWorkerIds, dbgId, reply);
 	}
 };
 
@@ -366,6 +393,28 @@ struct RecruitStorageRequest {
 	}
 };
 
+struct RecruitBlobWorkerReply {
+	constexpr static FileIdentifier file_identifier = 9908409;
+	WorkerInterface worker;
+	ProcessClass processClass;
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, worker, processClass);
+	}
+};
+
+struct RecruitBlobWorkerRequest {
+	constexpr static FileIdentifier file_identifier = 72435;
+	std::vector<AddressExclusion> excludeAddresses;
+	ReplyPromise<RecruitBlobWorkerReply> reply;
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, excludeAddresses, reply);
+	}
+};
+
 struct RegisterWorkerRequest {
 	constexpr static FileIdentifier file_identifier = 14332605;
 	WorkerInterface wi;
@@ -375,12 +424,14 @@ struct RegisterWorkerRequest {
 	Generation generation;
 	Optional<DataDistributorInterface> distributorInterf;
 	Optional<RatekeeperInterface> ratekeeperInterf;
+	Optional<BlobManagerInterface> blobManagerInterf;
 	Standalone<VectorRef<StringRef>> issues;
 	std::vector<NetworkAddress> incompatiblePeers;
 	ReplyPromise<RegisterWorkerReply> reply;
 	bool degraded;
 	Version lastSeenKnobVersion;
 	ConfigClassSet knobConfigClassSet;
+	bool requestDbInfo;
 
 	RegisterWorkerRequest()
 	  : priorityInfo(ProcessClass::UnsetFit, false, ClusterControllerPriorityInfo::FitnessUnknown), degraded(false) {}
@@ -391,12 +442,14 @@ struct RegisterWorkerRequest {
 	                      Generation generation,
 	                      Optional<DataDistributorInterface> ddInterf,
 	                      Optional<RatekeeperInterface> rkInterf,
+	                      Optional<BlobManagerInterface> bmInterf,
 	                      bool degraded,
 	                      Version lastSeenKnobVersion,
 	                      ConfigClassSet knobConfigClassSet)
 	  : wi(wi), initialClass(initialClass), processClass(processClass), priorityInfo(priorityInfo),
-	    generation(generation), distributorInterf(ddInterf), ratekeeperInterf(rkInterf), degraded(degraded),
-	    lastSeenKnobVersion(lastSeenKnobVersion), knobConfigClassSet(knobConfigClassSet) {}
+	    generation(generation), distributorInterf(ddInterf), ratekeeperInterf(rkInterf), blobManagerInterf(bmInterf),
+	    degraded(degraded), lastSeenKnobVersion(lastSeenKnobVersion), knobConfigClassSet(knobConfigClassSet),
+	    requestDbInfo(false) {}
 
 	template <class Ar>
 	void serialize(Ar& ar) {
@@ -408,12 +461,14 @@ struct RegisterWorkerRequest {
 		           generation,
 		           distributorInterf,
 		           ratekeeperInterf,
+		           blobManagerInterf,
 		           issues,
 		           incompatiblePeers,
 		           reply,
 		           degraded,
 		           lastSeenKnobVersion,
-		           knobConfigClassSet);
+		           knobConfigClassSet,
+		           requestDbInfo);
 	}
 };
 
@@ -447,6 +502,49 @@ struct UpdateWorkerHealthRequest {
 	}
 };
 
+struct TLogRejoinReply {
+	constexpr static FileIdentifier file_identifier = 11;
+
+	// false means someone else registered, so we should re-register.  true means this master is recovered, so don't
+	// send again to the same master.
+	bool masterIsRecovered;
+	TLogRejoinReply() = default;
+	explicit TLogRejoinReply(bool masterIsRecovered) : masterIsRecovered(masterIsRecovered) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, masterIsRecovered);
+	}
+};
+
+struct TLogRejoinRequest {
+	constexpr static FileIdentifier file_identifier = 15692200;
+	TLogInterface myInterface;
+	ReplyPromise<TLogRejoinReply> reply;
+
+	TLogRejoinRequest() {}
+	explicit TLogRejoinRequest(const TLogInterface& interf) : myInterface(interf) {}
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, myInterface, reply);
+	}
+};
+
+struct BackupWorkerDoneRequest {
+	constexpr static FileIdentifier file_identifier = 8736351;
+	UID workerUID;
+	LogEpoch backupEpoch;
+	ReplyPromise<Void> reply;
+
+	BackupWorkerDoneRequest() : workerUID(), backupEpoch(-1) {}
+	BackupWorkerDoneRequest(UID id, LogEpoch epoch) : workerUID(id), backupEpoch(epoch) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, workerUID, backupEpoch, reply);
+	}
+};
+
 struct InitializeTLogRequest {
 	constexpr static FileIdentifier file_identifier = 15604392;
 	UID recruitmentID;
@@ -465,6 +563,7 @@ struct InitializeTLogRequest {
 	Version startVersion;
 	int logRouterTags;
 	int txsTags;
+	UID clusterId;
 
 	ReplyPromise<struct TLogInterface> reply;
 
@@ -489,7 +588,8 @@ struct InitializeTLogRequest {
 		           reply,
 		           logVersion,
 		           spillType,
-		           txsTags);
+		           txsTags,
+		           clusterId);
 	}
 };
 
@@ -547,7 +647,6 @@ struct InitializeBackupRequest {
 // FIXME: Rename to InitializeMasterRequest, etc
 struct RecruitMasterRequest {
 	constexpr static FileIdentifier file_identifier = 12684574;
-	Arena arena;
 	LifetimeToken lifetime;
 	bool forceRecovery;
 	ReplyPromise<struct MasterInterface> reply;
@@ -557,13 +656,14 @@ struct RecruitMasterRequest {
 		if constexpr (!is_fb_function<Ar>) {
 			ASSERT(ar.protocolVersion().isValid());
 		}
-		serializer(ar, lifetime, forceRecovery, reply, arena);
+		serializer(ar, lifetime, forceRecovery, reply);
 	}
 };
 
 struct InitializeCommitProxyRequest {
 	constexpr static FileIdentifier file_identifier = 10344153;
 	MasterInterface master;
+	LifetimeToken masterLifetime;
 	uint64_t recoveryCount;
 	Version recoveryTransactionVersion;
 	bool firstProxy;
@@ -571,19 +671,20 @@ struct InitializeCommitProxyRequest {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, master, recoveryCount, recoveryTransactionVersion, firstProxy, reply);
+		serializer(ar, master, masterLifetime, recoveryCount, recoveryTransactionVersion, firstProxy, reply);
 	}
 };
 
 struct InitializeGrvProxyRequest {
 	constexpr static FileIdentifier file_identifier = 8265613;
 	MasterInterface master;
+	LifetimeToken masterLifetime;
 	uint64_t recoveryCount;
 	ReplyPromise<GrvProxyInterface> reply;
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, master, recoveryCount, reply);
+		serializer(ar, master, masterLifetime, recoveryCount, reply);
 	}
 };
 
@@ -610,6 +711,20 @@ struct InitializeRatekeeperRequest {
 	template <class Ar>
 	void serialize(Ar& ar) {
 		serializer(ar, reqId, reply);
+	}
+};
+
+struct InitializeBlobManagerRequest {
+	constexpr static FileIdentifier file_identifier = 2567474;
+	UID reqId;
+	int64_t epoch;
+	ReplyPromise<BlobManagerInterface> reply;
+
+	InitializeBlobManagerRequest() {}
+	explicit InitializeBlobManagerRequest(UID uid, int64_t epoch) : reqId(uid), epoch(epoch) {}
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, reqId, epoch, reply);
 	}
 };
 
@@ -645,11 +760,34 @@ struct InitializeStorageRequest {
 	KeyValueStoreType storeType;
 	Optional<std::pair<UID, Version>>
 	    tssPairIDAndVersion; // Only set if recruiting a tss. Will be the UID and Version of its SS pair.
+	UID clusterId; // Unique cluster identifier. Only needed at recruitment, will be read from txnStateStore on recovery
 	ReplyPromise<InitializeStorageReply> reply;
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		serializer(ar, seedTag, reqId, interfaceId, storeType, reply, tssPairIDAndVersion);
+		serializer(ar, seedTag, reqId, interfaceId, storeType, reply, tssPairIDAndVersion, clusterId);
+	}
+};
+
+struct InitializeBlobWorkerReply {
+	constexpr static FileIdentifier file_identifier = 6095215;
+	BlobWorkerInterface interf;
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, interf);
+	}
+};
+
+struct InitializeBlobWorkerRequest {
+	constexpr static FileIdentifier file_identifier = 5838547;
+	UID reqId;
+	UID interfaceId;
+	ReplyPromise<InitializeBlobWorkerReply> reply;
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, reqId, interfaceId, reply);
 	}
 };
 
@@ -813,6 +951,8 @@ struct Role {
 	static const Role LOG_ROUTER;
 	static const Role DATA_DISTRIBUTOR;
 	static const Role RATEKEEPER;
+	static const Role BLOB_MANAGER;
+	static const Role BLOB_WORKER;
 	static const Role STORAGE_CACHE;
 	static const Role COORDINATOR;
 	static const Role BACKUP;
@@ -843,6 +983,10 @@ struct Role {
 			return DATA_DISTRIBUTOR;
 		case ProcessClass::Ratekeeper:
 			return RATEKEEPER;
+		case ProcessClass::BlobManager:
+			return BLOB_MANAGER;
+		case ProcessClass::BlobWorker:
+			return BLOB_WORKER;
 		case ProcessClass::StorageCache:
 			return STORAGE_CACHE;
 		case ProcessClass::Backup:
@@ -884,7 +1028,7 @@ ACTOR Future<Void> extractClusterInterface(
     Reference<AsyncVar<Optional<struct ClusterControllerFullInterface>> const> in,
     Reference<AsyncVar<Optional<struct ClusterInterface>>> out);
 
-ACTOR Future<Void> fdbd(Reference<ClusterConnectionFile> ccf,
+ACTOR Future<Void> fdbd(Reference<IClusterConnectionRecord> ccr,
                         LocalityData localities,
                         ProcessClass processClass,
                         std::string dataFolder,
@@ -898,12 +1042,16 @@ ACTOR Future<Void> fdbd(Reference<ClusterConnectionFile> ccf,
                         std::map<std::string, std::string> manualKnobOverrides,
                         ConfigDBType configDBType);
 
-ACTOR Future<Void> clusterController(Reference<ClusterConnectionFile> ccf,
+ACTOR Future<Void> clusterController(Reference<IClusterConnectionRecord> ccr,
                                      Reference<AsyncVar<Optional<ClusterControllerFullInterface>>> currentCC,
                                      Reference<AsyncVar<ClusterControllerPriorityInfo>> asyncPriorityInfo,
                                      Future<Void> recoveredDiskFiles,
                                      LocalityData locality,
                                      ConfigDBType configDBType);
+
+ACTOR Future<Void> blobWorker(BlobWorkerInterface bwi,
+                              ReplyPromise<InitializeBlobWorkerReply> blobWorkerReady,
+                              Reference<AsyncVar<ServerDBInfo> const> dbInfo);
 
 // These servers are started by workerServer
 class IKeyValueStore;
@@ -912,6 +1060,7 @@ class IDiskQueue;
 ACTOR Future<Void> storageServer(IKeyValueStore* persistentData,
                                  StorageServerInterface ssi,
                                  Tag seedTag,
+                                 UID clusterId,
                                  Version tssSeedVersion,
                                  ReplyPromise<InitializeStorageReply> recruitReply,
                                  Reference<AsyncVar<ServerDBInfo> const> db,
@@ -922,8 +1071,8 @@ ACTOR Future<Void> storageServer(
     Reference<AsyncVar<ServerDBInfo> const> db,
     std::string folder,
     Promise<Void> recovered,
-    Reference<ClusterConnectionFile>
-        connFile); // changes pssi->id() to be the recovered ID); // changes pssi->id() to be the recovered ID
+    Reference<IClusterConnectionRecord>
+        connRecord); // changes pssi->id() to be the recovered ID); // changes pssi->id() to be the recovered ID
 ACTOR Future<Void> masterServer(MasterInterface mi,
                                 Reference<AsyncVar<ServerDBInfo> const> db,
                                 Reference<AsyncVar<Optional<ClusterControllerFullInterface>> const> ccInterface,
@@ -958,6 +1107,7 @@ ACTOR Future<Void> logRouter(TLogInterface interf,
                              Reference<AsyncVar<ServerDBInfo> const> db);
 ACTOR Future<Void> dataDistributor(DataDistributorInterface ddi, Reference<AsyncVar<ServerDBInfo> const> db);
 ACTOR Future<Void> ratekeeper(RatekeeperInterface rki, Reference<AsyncVar<ServerDBInfo> const> db);
+ACTOR Future<Void> blobManager(BlobManagerInterface bmi, Reference<AsyncVar<ServerDBInfo> const> db, int64_t epoch);
 ACTOR Future<Void> storageCacheServer(StorageServerInterface interf,
                                       uint16_t id,
                                       Reference<AsyncVar<ServerDBInfo> const> db);
@@ -1012,6 +1162,66 @@ ACTOR Future<Void> tLog(IKeyValueStore* persistentData,
 }
 
 typedef decltype(&tLog) TLogFn;
+
+ACTOR template <class T>
+Future<T> ioTimeoutError(Future<T> what, double time) {
+	// Before simulation is sped up, IO operations can take a very long time so limit timeouts
+	// to not end until at least time after simulation is sped up.
+	if (g_network->isSimulated() && !g_simulator.speedUpSimulation) {
+		time += std::max(0.0, FLOW_KNOBS->SIM_SPEEDUP_AFTER_SECONDS - now());
+	}
+	Future<Void> end = lowPriorityDelay(time);
+	choose {
+		when(T t = wait(what)) { return t; }
+		when(wait(end)) {
+			Error err = io_timeout();
+			if (g_network->isSimulated() && !g_simulator.getCurrentProcess()->isReliable()) {
+				err = err.asInjectedFault();
+			}
+			TraceEvent(SevError, "IoTimeoutError").error(err);
+			throw err;
+		}
+	}
+}
+
+ACTOR template <class T>
+Future<T> ioDegradedOrTimeoutError(Future<T> what,
+                                   double errTime,
+                                   Reference<AsyncVar<bool>> degraded,
+                                   double degradedTime) {
+	// Before simulation is sped up, IO operations can take a very long time so limit timeouts
+	// to not end until at least time after simulation is sped up.
+	if (g_network->isSimulated() && !g_simulator.speedUpSimulation) {
+		double timeShift = std::max(0.0, FLOW_KNOBS->SIM_SPEEDUP_AFTER_SECONDS - now());
+		errTime += timeShift;
+		degradedTime += timeShift;
+	}
+
+	if (degradedTime < errTime) {
+		Future<Void> degradedEnd = lowPriorityDelay(degradedTime);
+		choose {
+			when(T t = wait(what)) { return t; }
+			when(wait(degradedEnd)) {
+				TEST(true); // TLog degraded
+				TraceEvent(SevWarnAlways, "IoDegraded").log();
+				degraded->set(true);
+			}
+		}
+	}
+
+	Future<Void> end = lowPriorityDelay(errTime - degradedTime);
+	choose {
+		when(T t = wait(what)) { return t; }
+		when(wait(end)) {
+			Error err = io_timeout();
+			if (g_network->isSimulated() && !g_simulator.getCurrentProcess()->isReliable()) {
+				err = err.asInjectedFault();
+			}
+			TraceEvent(SevError, "IoTimeoutError").error(err);
+			throw err;
+		}
+	}
+}
 
 #include "fdbserver/ServerDBInfo.h"
 #include "flow/unactorcompiler.h"

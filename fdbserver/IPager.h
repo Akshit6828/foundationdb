@@ -26,7 +26,7 @@
 
 #include "flow/flow.h"
 #include "fdbclient/FDBTypes.h"
-#include "flow/crc32c.h"
+#include "flow/xxhash.h"
 
 #ifndef VALGRIND
 #define VALGRIND_MAKE_MEM_UNDEFINED(x, y)
@@ -49,7 +49,7 @@ static const char* const PagerEventReasonsStrings[] = {
 	"Get", "GetR", "GetRPF", "Commit", "LazyClr", "Meta", "Unknown"
 };
 
-static const int nonBtreeLevel = 0;
+static const unsigned int nonBtreeLevel = 0;
 static const std::vector<std::pair<PagerEvents, PagerEventReasons>> possibleEventReasonPairs = {
 	{ PagerEvents::CacheLookup, PagerEventReasons::Commit },
 	{ PagerEvents::CacheLookup, PagerEventReasons::LazyClear },
@@ -101,7 +101,7 @@ public:
 
 	uint8_t* mutate() { return (uint8_t*)buffer; }
 
-	typedef uint32_t Checksum;
+	typedef XXH64_hash_t Checksum;
 
 	// Usable size, without checksum
 	int size() const { return logicalSize - sizeof(Checksum); }
@@ -143,7 +143,7 @@ public:
 
 	Checksum& getChecksum() { return *(Checksum*)(buffer + size()); }
 
-	Checksum calculateChecksum(LogicalPageID pageID) { return crc32c_append(pageID, buffer, size()); }
+	Checksum calculateChecksum(LogicalPageID pageID) { return XXH3_64bits_withSeed(buffer, size(), pageID); }
 
 	void updateChecksum(LogicalPageID pageID) { getChecksum() = calculateChecksum(pageID); }
 
@@ -170,7 +170,12 @@ public:
 	                                                           int priority,
 	                                                           bool cacheable,
 	                                                           bool nohit) = 0;
-	virtual bool tryEvictPage(LogicalPageID id) = 0;
+	virtual Future<Reference<const ArenaPage>> getMultiPhysicalPage(PagerEventReasons reason,
+	                                                                unsigned int level,
+	                                                                VectorRef<LogicalPageID> pageIDs,
+	                                                                int priority,
+	                                                                bool cacheable,
+	                                                                bool nohit) = 0;
 	virtual Version getVersion() const = 0;
 
 	virtual Key getMetaKey() const = 0;
@@ -185,7 +190,7 @@ public:
 class IPager2 : public IClosable {
 public:
 	// Returns an ArenaPage that can be passed to writePage. The data in the returned ArenaPage might not be zeroed.
-	virtual Reference<ArenaPage> newPageBuffer() = 0;
+	virtual Reference<ArenaPage> newPageBuffer(size_t size = 1) = 0;
 
 	// Returns the usable size of pages returned by the pager (i.e. the size of the page that isn't pager overhead).
 	// For a given pager instance, separate calls to this function must return the same value.
@@ -194,6 +199,9 @@ public:
 	virtual int getPhysicalPageSize() const = 0;
 	virtual int getLogicalPageSize() const = 0;
 	virtual int getPagesPerExtent() const = 0;
+
+	// Write detail fields with pager stats to a trace event
+	virtual void toTraceEvent(TraceEvent& e) const = 0;
 
 	// Allocate a new page ID for a subsequent write.  The page will be considered in-use after the next commit
 	// regardless of whether or not it was written to.
@@ -207,9 +215,8 @@ public:
 	// may see the effects of this write.
 	virtual void updatePage(PagerEventReasons reason,
 	                        unsigned int level,
-	                        LogicalPageID pageID,
+	                        Standalone<VectorRef<LogicalPageID>> pageIDs,
 	                        Reference<ArenaPage> data) = 0;
-
 	// Try to atomically update the contents of a page as of version v in the next commit.
 	// If the pager is unable to do this at this time, it may choose to write the data to a new page ID
 	// instead and return the new page ID to the caller.  Otherwise the original pageID argument will be returned.
@@ -238,10 +245,17 @@ public:
 	// considered likely to be needed soon.
 	virtual Future<Reference<ArenaPage>> readPage(PagerEventReasons reason,
 	                                              unsigned int level,
-	                                              LogicalPageID pageID,
+	                                              PhysicalPageID pageIDs,
 	                                              int priority,
 	                                              bool cacheable,
 	                                              bool noHit) = 0;
+	virtual Future<Reference<ArenaPage>> readMultiPage(PagerEventReasons reason,
+	                                                   unsigned int level,
+	                                                   Standalone<VectorRef<PhysicalPageID>> pageIDs,
+	                                                   int priority,
+	                                                   bool cacheable,
+	                                                   bool noHit) = 0;
+
 	virtual Future<Reference<ArenaPage>> readExtent(LogicalPageID pageID) = 0;
 	virtual void releaseExtentReadLock() = 0;
 
@@ -291,6 +305,9 @@ public:
 	// If any snapshots are in use at a version less than v, the pager can either forcefully
 	// invalidate them or keep their versions around until the snapshots are no longer in use.
 	virtual void setOldestReadableVersion(Version v) = 0;
+
+	// Advance the commit version and the oldest readble version and commit until the remap queue is empty.
+	virtual Future<Void> clearRemapQueue() = 0;
 
 protected:
 	~IPager2() {} // Destruction should be done using close()/dispose() from the IClosable interface

@@ -19,13 +19,17 @@
  */
 
 #include <cinttypes>
+#include "contrib/fmt-8.0.1/include/fmt/format.h"
+#include "fdbclient/BlobWorkerInterface.h"
 #include "fdbserver/Status.h"
+#include "flow/ITrace.h"
 #include "flow/Trace.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/SystemData.h"
 #include "fdbclient/ReadYourWrites.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include <time.h>
+#include "fdbserver/ClusterRecovery.actor.h"
 #include "fdbserver/CoordinationInterface.h"
 #include "fdbserver/DataDistribution.actor.h"
 #include "flow/UnitTest.h"
@@ -95,7 +99,6 @@ extern int limitReasonEnd;
 extern const char* limitReasonName[];
 extern const char* limitReasonDesc[];
 
-struct WorkerEvents : std::map<NetworkAddress, TraceEventFields> {};
 typedef std::map<std::string, TraceEventFields> EventMap;
 
 ACTOR static Future<Optional<TraceEventFields>> latestEventOnWorker(WorkerInterface worker, std::string eventName) {
@@ -115,7 +118,7 @@ ACTOR static Future<Optional<TraceEventFields>> latestEventOnWorker(WorkerInterf
 	}
 }
 
-ACTOR static Future<Optional<std::pair<WorkerEvents, std::set<std::string>>>> latestEventOnWorkers(
+ACTOR Future<Optional<std::pair<WorkerEvents, std::set<std::string>>>> latestEventOnWorkers(
     std::vector<WorkerDetails> workers,
     std::string eventName) {
 	try {
@@ -724,6 +727,7 @@ ACTOR static Future<JsonBuilderObject> processStatusFetcher(
     std::vector<std::pair<TLogInterface, EventMap>> tLogs,
     std::vector<std::pair<CommitProxyInterface, EventMap>> commitProxies,
     std::vector<std::pair<GrvProxyInterface, EventMap>> grvProxies,
+    std::vector<BlobWorkerInterface> blobWorkers,
     ServerCoordinators coordinators,
     Database cx,
     Optional<DatabaseConfiguration> configuration,
@@ -795,6 +799,10 @@ ACTOR static Future<JsonBuilderObject> processStatusFetcher(
 		roles.addRole("ratekeeper", db->get().ratekeeper.get());
 	}
 
+	if (CLIENT_KNOBS->ENABLE_BLOB_GRANULES && db->get().blobManager.present()) {
+		roles.addRole("blob_manager", db->get().blobManager.get());
+	}
+
 	for (auto& tLogSet : db->get().logSystemConfig.tLogs) {
 		for (auto& it : tLogSet.logRouters) {
 			if (it.present()) {
@@ -813,7 +821,7 @@ ACTOR static Future<JsonBuilderObject> processStatusFetcher(
 		}
 	}
 
-	for (auto& coordinator : coordinators.ccf->getConnectionString().coordinators()) {
+	for (auto& coordinator : coordinators.ccr->getConnectionString().coordinators()) {
 		roles.addCoordinatorRole(coordinator);
 	}
 
@@ -856,6 +864,13 @@ ACTOR static Future<JsonBuilderObject> processStatusFetcher(
 	for (res = resolvers.begin(); res != resolvers.end(); ++res) {
 		roles.addRole("resolver", *res);
 		wait(yield());
+	}
+
+	if (CLIENT_KNOBS->ENABLE_BLOB_GRANULES) {
+		for (auto blobWorker : blobWorkers) {
+			roles.addRole("blob_worker", blobWorker);
+			wait(yield());
+		}
 	}
 
 	for (workerItr = workers.begin(); workerItr != workers.end(); ++workerItr) {
@@ -1136,6 +1151,7 @@ static JsonBuilderObject clientStatusFetcher(
 }
 
 ACTOR static Future<JsonBuilderObject> recoveryStateStatusFetcher(Database cx,
+                                                                  WorkerDetails ccWorker,
                                                                   WorkerDetails mWorker,
                                                                   int workerCount,
                                                                   std::set<std::string>* incomplete_reasons,
@@ -1143,13 +1159,18 @@ ACTOR static Future<JsonBuilderObject> recoveryStateStatusFetcher(Database cx,
 	state JsonBuilderObject message;
 	state Transaction tr(cx);
 	try {
-		state Future<TraceEventFields> mdActiveGensF = timeoutError(
-		    mWorker.interf.eventLogRequest.getReply(EventLogRequest(LiteralStringRef("MasterRecoveryGenerations"))),
-		    1.0);
-		state Future<TraceEventFields> mdF = timeoutError(
-		    mWorker.interf.eventLogRequest.getReply(EventLogRequest(LiteralStringRef("MasterRecoveryState"))), 1.0);
-		state Future<TraceEventFields> mDBAvailableF = timeoutError(
-		    mWorker.interf.eventLogRequest.getReply(EventLogRequest(LiteralStringRef("MasterRecoveryAvailable"))), 1.0);
+		state Future<TraceEventFields> mdActiveGensF =
+		    timeoutError(ccWorker.interf.eventLogRequest.getReply(EventLogRequest(StringRef(
+		                     getRecoveryEventName(ClusterRecoveryEventType::CLUSTER_RECOVERY_GENERATION_EVENT_NAME)))),
+		                 1.0);
+		state Future<TraceEventFields> mdF =
+		    timeoutError(ccWorker.interf.eventLogRequest.getReply(EventLogRequest(StringRef(
+		                     getRecoveryEventName(ClusterRecoveryEventType::CLUSTER_RECOVERY_STATE_EVENT_NAME)))),
+		                 1.0);
+		state Future<TraceEventFields> mDBAvailableF =
+		    timeoutError(ccWorker.interf.eventLogRequest.getReply(EventLogRequest(StringRef(
+		                     getRecoveryEventName(ClusterRecoveryEventType::CLUSTER_RECOVERY_AVAILABLE_EVENT_NAME)))),
+		                 1.0);
 		tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 		state Future<ErrorOr<Version>> rvF = errorOr(timeoutError(tr.getReadVersion(), 1.0));
 
@@ -2423,7 +2444,7 @@ static JsonBuilderObject faultToleranceStatusFetcher(DatabaseConfiguration confi
 		workerZones[worker.interf.address()] = worker.interf.locality.zoneId().orDefault(LiteralStringRef(""));
 	}
 	std::map<StringRef, int> coordinatorZoneCounts;
-	for (auto& coordinator : coordinators.ccf->getConnectionString().coordinators()) {
+	for (auto& coordinator : coordinators.ccr->getConnectionString().coordinators()) {
 		auto zone = workerZones[coordinator];
 		coordinatorZoneCounts[zone] += 1;
 	}
@@ -2696,6 +2717,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 	state JsonBuilderArray messages;
 	state std::set<std::string> status_incomplete_reasons;
 	state WorkerDetails mWorker; // Master worker
+	state WorkerDetails ccWorker; // Cluster-Controller worker
 	state WorkerDetails ddWorker; // DataDistributor worker
 	state WorkerDetails rkWorker; // Ratekeeper worker
 
@@ -2707,6 +2729,15 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		} else {
 			messages.push_back(
 			    JsonString::makeMessage("unreachable_master_worker", "Unable to locate the master worker."));
+		}
+
+		// Get the cluster-controller Worker interface
+		Optional<WorkerDetails> _ccWorker = getWorker(workers, db->get().clusterInterface.address());
+		if (_ccWorker.present()) {
+			ccWorker = _ccWorker.get();
+		} else {
+			messages.push_back(JsonString::makeMessage("unreachable_cluster_controller_worker",
+			                                           "Unable to locate the cluster-controller worker."));
 		}
 
 		// Get the DataDistributor worker interface
@@ -2776,8 +2807,8 @@ ACTOR Future<StatusReply> clusterGetStatus(
 
 		// construct status information for cluster subsections
 		state int statusCode = (int)RecoveryStatus::END;
-		state JsonBuilderObject recoveryStateStatus =
-		    wait(recoveryStateStatusFetcher(cx, mWorker, workers.size(), &status_incomplete_reasons, &statusCode));
+		state JsonBuilderObject recoveryStateStatus = wait(
+		    recoveryStateStatusFetcher(cx, ccWorker, mWorker, workers.size(), &status_incomplete_reasons, &statusCode));
 
 		// machine metrics
 		state WorkerEvents mMetrics = workerEventsVec[0].present() ? workerEventsVec[0].get().first : WorkerEvents();
@@ -2802,11 +2833,12 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		state std::vector<std::pair<TLogInterface, EventMap>> tLogs;
 		state std::vector<std::pair<CommitProxyInterface, EventMap>> commitProxies;
 		state std::vector<std::pair<GrvProxyInterface, EventMap>> grvProxies;
+		state std::vector<BlobWorkerInterface> blobWorkers;
 		state JsonBuilderObject qos;
 		state JsonBuilderObject data_overlay;
 
 		statusObj["protocol_version"] = format("%" PRIx64, g_network->protocolVersion().version());
-		statusObj["connection_string"] = coordinators.ccf->getConnectionString().toString();
+		statusObj["connection_string"] = coordinators.ccr->getConnectionString().toString();
 		statusObj["bounce_impact"] = getBounceImpactInfo(statusCode);
 
 		state Optional<DatabaseConfiguration> configuration;
@@ -2874,6 +2906,11 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			    errorOr(getCommitProxiesAndMetrics(db, address_workers));
 			state Future<ErrorOr<std::vector<std::pair<GrvProxyInterface, EventMap>>>> grvProxyFuture =
 			    errorOr(getGrvProxiesAndMetrics(db, address_workers));
+			state Future<ErrorOr<std::vector<BlobWorkerInterface>>> blobWorkersFuture;
+
+			if (CLIENT_KNOBS->ENABLE_BLOB_GRANULES) {
+				blobWorkersFuture = errorOr(timeoutError(getBlobWorkers(cx, true), 5.0));
+			}
 
 			state int minStorageReplicasRemaining = -1;
 			state int fullyReplicatedRegions = -1;
@@ -2990,6 +3027,18 @@ ACTOR Future<StatusReply> clusterGetStatus(
 				messages.push_back(
 				    JsonBuilder::makeMessage("grv_proxies_error", "Timed out trying to retrieve grv proxies."));
 			}
+
+			// ...also blob workers
+			if (CLIENT_KNOBS->ENABLE_BLOB_GRANULES) {
+				ErrorOr<std::vector<BlobWorkerInterface>> _blobWorkers = wait(blobWorkersFuture);
+				if (_blobWorkers.present()) {
+					blobWorkers = _blobWorkers.get();
+				} else {
+					messages.push_back(
+					    JsonBuilder::makeMessage("blob_workers_error", "Timed out trying to retrieve blob workers."));
+				}
+			}
+
 			wait(waitForAll(warningFutures));
 		} else {
 			// Set layers status to { _valid: false, error: "configurationMissing"}
@@ -3013,6 +3062,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		                              tLogs,
 		                              commitProxies,
 		                              grvProxies,
+		                              blobWorkers,
 		                              coordinators,
 		                              cx,
 		                              configuration,
@@ -3276,7 +3326,7 @@ JsonBuilderObject randomDocument(const std::vector<std::string>& strings, int& l
 	return r;
 }
 
-TEST_CASE("/status/json/builderPerf") {
+TEST_CASE("Lstatus/json/builderPerf") {
 	std::vector<std::string> strings;
 	int c = 1000000;
 	printf("Generating random strings\n");
@@ -3330,16 +3380,16 @@ TEST_CASE("/status/json/builderPerf") {
 	}
 
 	double elapsed = generated + serialized;
-	printf("RESULT: %" PRId64
-	       " bytes  %d elements  %d levels  %f seconds (%f gen, %f serialize)  %f MB/s  %f items/s\n",
-	       bytes,
-	       iterations * elements,
-	       level,
-	       elapsed,
-	       generated,
-	       elapsed - generated,
-	       bytes / elapsed / 1e6,
-	       iterations * elements / elapsed);
+	fmt::print("RESULT: {0}"
+	           " bytes  {1} elements  {2} levels  {3} seconds ({4} gen, {5} serialize)  {6} MB/s  {7} items/s\n",
+	           bytes,
+	           iterations * elements,
+	           level,
+	           elapsed,
+	           generated,
+	           elapsed - generated,
+	           bytes / elapsed / 1e6,
+	           iterations * elements / elapsed);
 
 	return Void();
 }

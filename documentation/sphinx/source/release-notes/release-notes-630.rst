@@ -2,6 +2,19 @@
 Release Notes
 #############
 
+6.3.23
+======
+* Fixed a bug that remoteDCIsHealthy logic is not guarded by CC_ENABLE_WORKER_HEALTH_MONITOR, which may prevent HA failback. `(PR #6106) <https://github.com/apple/foundationdb/pull/6106>`_
+* Fixed a race condition with updating the coordinated state and updating the master registration. `(PR #6088) <https://github.com/apple/foundationdb/pull/6088>`_
+* Changed dbinfo broadcast to be explicitly requested by the worker registration message. `(PR #6073) <https://github.com/apple/foundationdb/pull/6073>`_
+
+6.3.22
+======
+* Added histograms to client GRV batcher. `(PR #5760) <https://github.com/apple/foundationdb/pull/5760>`_
+* Added FastAlloc memory utilization trace. `(PR #5759) <https://github.com/apple/foundationdb/pull/5759>`_
+* Added locality cache size to TransactionMetrics. `(PR #5771) <https://github.com/apple/foundationdb/pull/5771>`_
+* Added a new feature that allows FDB to failover to remote DC when the primary is experiencing massive grey failure. This feature is turned off by default. `(PR #5774) <https://github.com/apple/foundationdb/pull/5774>`_
+
 6.3.21
 ======
 * Added a ThreadID field to all trace events for the purpose of multi-threaded client debugging. `(PR #5665) <https://github.com/apple/foundationdb/pull/5665>`_

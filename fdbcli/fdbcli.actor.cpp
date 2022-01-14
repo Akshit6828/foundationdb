@@ -19,6 +19,8 @@
  */
 
 #include "boost/lexical_cast.hpp"
+#include "contrib/fmt-8.0.1/include/fmt/format.h"
+#include "fdbclient/ClusterConnectionFile.h"
 #include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/FDBTypes.h"
 #include "fdbclient/IClientApi.h"
@@ -35,10 +37,12 @@
 #include "fdbclient/Schemas.h"
 #include "fdbclient/CoordinationInterface.h"
 #include "fdbclient/FDBOptions.g.h"
+#include "fdbclient/SystemData.h"
 #include "fdbclient/TagThrottle.actor.h"
 #include "fdbclient/Tuple.h"
 
 #include "fdbclient/ThreadSafeTransaction.h"
+#include "flow/ArgParseUtil.h"
 #include "flow/DeterministicRandom.h"
 #include "flow/FastRef.h"
 #include "flow/Platform.h"
@@ -95,7 +99,7 @@ enum {
 };
 
 CSimpleOpt::SOption g_rgOptions[] = { { OPT_CONNFILE, "-C", SO_REQ_SEP },
-	                                  { OPT_CONNFILE, "--cluster_file", SO_REQ_SEP },
+	                                  { OPT_CONNFILE, "--cluster-file", SO_REQ_SEP },
 	                                  { OPT_DATABASE, "-d", SO_REQ_SEP },
 	                                  { OPT_TRACE, "--log", SO_NONE },
 	                                  { OPT_TRACE_DIR, "--log-dir", SO_REQ_SEP },
@@ -109,9 +113,9 @@ CSimpleOpt::SOption g_rgOptions[] = { { OPT_CONNFILE, "-C", SO_REQ_SEP },
 	                                  { OPT_STATUS_FROM_JSON, "--status-from-json", SO_REQ_SEP },
 	                                  { OPT_VERSION, "--version", SO_NONE },
 	                                  { OPT_VERSION, "-v", SO_NONE },
-	                                  { OPT_BUILD_FLAGS, "--build_flags", SO_NONE },
-	                                  { OPT_TRACE_FORMAT, "--trace_format", SO_REQ_SEP },
-	                                  { OPT_KNOB, "--knob_", SO_REQ_SEP },
+	                                  { OPT_BUILD_FLAGS, "--build-flags", SO_NONE },
+	                                  { OPT_TRACE_FORMAT, "--trace-format", SO_REQ_SEP },
+	                                  { OPT_KNOB, "--knob-", SO_REQ_SEP },
 	                                  { OPT_DEBUG_TLS, "--debug-tls", SO_NONE },
 	                                  { OPT_API_VERSION, "--api-version", SO_REQ_SEP },
 
@@ -423,7 +427,7 @@ static void printProgramUsage(const char* name) {
 	       "  --log-dir PATH Specifes the output directory for trace files. If\n"
 	       "                 unspecified, defaults to the current directory. Has\n"
 	       "                 no effect unless --log is specified.\n"
-	       "  --trace_format FORMAT\n"
+	       "  --trace-format FORMAT\n"
 	       "                 Select the format of the log files. xml (the default) and json\n"
 	       "                 are supported. Has no effect unless --log is specified.\n"
 	       "  --exec CMDS    Immediately executes the semicolon separated CLI commands\n"
@@ -435,11 +439,11 @@ static void printProgramUsage(const char* name) {
 #ifndef TLS_DISABLED
 	       TLS_HELP
 #endif
-	       "  --knob_KNOBNAME KNOBVALUE\n"
+	       "  --knob-KNOBNAME KNOBVALUE\n"
 	       "                 Changes a knob option. KNOBNAME should be lowercase.\n"
 	       "  --debug-tls    Prints the TLS configuration and certificate chain, then exits.\n"
 	       "                 Useful in reporting and diagnosing TLS issues.\n"
-	       "  --build_flags  Print build information and exit.\n"
+	       "  --build-flags  Print build information and exit.\n"
 	       "  -v, --version  Print FoundationDB CLI version information and exit.\n"
 	       "  -h, --help     Display this help and exit.\n");
 }
@@ -629,9 +633,9 @@ ACTOR Future<Void> commitTransaction(Reference<ITransaction> tr) {
 	wait(makeInterruptable(safeThreadFutureToFuture(tr->commit())));
 	auto ver = tr->getCommittedVersion();
 	if (ver != invalidVersion)
-		printf("Committed (%" PRId64 ")\n", ver);
+		fmt::print("Committed ({})\n", ver);
 	else
-		printf("Nothing to commit\n");
+		fmt::print("Nothing to commit\n");
 	return Void();
 }
 
@@ -1034,8 +1038,8 @@ ACTOR Future<bool> exclude(Database db,
 			    locality.c_str());
 		}
 
+		ClusterConnectionString ccs = wait(ccf->getStoredConnectionString());
 		bool foundCoordinator = false;
-		auto ccs = ClusterConnectionFile(ccf->getFilename()).getConnectionString();
 		for (const auto& c : ccs.coordinators()) {
 			if (std::count(exclusionVector.begin(), exclusionVector.end(), AddressExclusion(c.ip, c.port)) ||
 			    std::count(exclusionVector.begin(), exclusionVector.end(), AddressExclusion(c.ip))) {
@@ -1386,7 +1390,7 @@ struct CLIOptions {
 			commandLine += argv[a];
 		}
 
-		CSimpleOpt args(argc, argv, g_rgOptions);
+		CSimpleOpt args(argc, argv, g_rgOptions, SO_O_HYPHEN_TO_UNDERSCORE);
 
 		while (args.Next()) {
 			int ec = processArg(args);
@@ -1400,7 +1404,9 @@ struct CLIOptions {
 			exit_code = FDB_EXIT_ERROR;
 			return;
 		}
+	}
 
+	void setupKnobs() {
 		auto& g_knobs = IKnobCollection::getMutableGlobalKnobCollection();
 		for (const auto& [knobName, knobValueString] : knobs) {
 			try {
@@ -1513,13 +1519,12 @@ struct CLIOptions {
 			traceFormat = args.OptionArg();
 			break;
 		case OPT_KNOB: {
-			std::string syn = args.OptionSyntax();
-			if (!StringRef(syn).startsWith(LiteralStringRef("--knob_"))) {
-				fprintf(stderr, "ERROR: unable to parse knob option '%s'\n", syn.c_str());
+			Optional<std::string> knobName = extractPrefixedArgument("--knob", args.OptionSyntax());
+			if (!knobName.present()) {
+				fprintf(stderr, "ERROR: unable to parse knob option '%s'\n", args.OptionSyntax());
 				return FDB_EXIT_ERROR;
 			}
-			syn = syn.substr(7);
-			knobs.emplace_back(syn, args.OptionArg());
+			knobs.emplace_back(knobName.get(), args.OptionArg());
 			break;
 		}
 		case OPT_DEBUG_TLS:
@@ -1555,6 +1560,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise) {
 	state Database localDb;
 	state Reference<IDatabase> db;
 	state Reference<ITransaction> tr;
+	state Transaction trx;
 
 	state bool writeMode = false;
 
@@ -1584,12 +1590,12 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise) {
 	try {
 		localDb = Database::createDatabase(ccf, opt.api_version, IsInternal::False);
 		if (!opt.exec.present()) {
-			printf("Using cluster file `%s'.\n", ccf->getFilename().c_str());
+			printf("Using cluster file `%s'.\n", ccf->getLocation().c_str());
 		}
 		db = API->createDatabase(opt.clusterFile.c_str());
 	} catch (Error& e) {
 		fprintf(stderr, "ERROR: %s (%d)\n", e.what(), e.code());
-		printf("Unable to connect to cluster from `%s'\n", ccf->getFilename().c_str());
+		printf("Unable to connect to cluster from `%s'\n", ccf->getLocation().c_str());
 		return 1;
 	}
 
@@ -1600,7 +1606,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise) {
 		    .detail("Version", FDB_VT_VERSION)
 		    .detail("PackageName", FDB_VT_PACKAGE_NAME)
 		    .detailf("ActualTime", "%lld", DEBUG_DETERMINISM ? 0 : time(nullptr))
-		    .detail("ClusterFile", ccf->getFilename().c_str())
+		    .detail("ClusterFile", ccf->toString())
 		    .detail("ConnectionString", ccf->getConnectionString().toString())
 		    .setMaxFieldLength(10000)
 		    .detail("CommandLine", opt.commandLine)
@@ -1665,7 +1671,7 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise) {
 
 			// Don't put dangerous commands in the command history
 			if (line.find("writemode") == std::string::npos && line.find("expensive_data_check") == std::string::npos &&
-			    line.find("unlock") == std::string::npos)
+			    line.find("unlock") == std::string::npos && line.find("blobrange") == std::string::npos)
 				linenoise.historyAdd(line);
 		}
 
@@ -1873,6 +1879,20 @@ ACTOR Future<int> cli(CLIOptions opt, LineNoise* plinenoise) {
 
 				if (tokencmp(tokens[0], "lock")) {
 					bool _result = wait(makeInterruptable(lockCommandActor(db, tokens)));
+					if (!_result)
+						is_error = true;
+					continue;
+				}
+
+				if (tokencmp(tokens[0], "changefeed")) {
+					bool _result = wait(makeInterruptable(changeFeedCommandActor(localDb, tokens, warn)));
+					if (!_result)
+						is_error = true;
+					continue;
+				}
+
+				if (tokencmp(tokens[0], "blobrange")) {
+					bool _result = wait(makeInterruptable(blobRangeCommandActor(localDb, tokens)));
 					if (!_result)
 						is_error = true;
 					continue;
@@ -2415,8 +2435,6 @@ int main(int argc, char** argv) {
 
 	registerCrashHandler();
 
-	IKnobCollection::setGlobalKnobCollection(IKnobCollection::Type::CLIENT, Randomize::False, IsSimulated::False);
-
 #ifdef __unixish__
 	struct sigaction act;
 
@@ -2517,6 +2535,10 @@ int main(int argc, char** argv) {
 	try {
 		API->selectApiVersion(opt.api_version);
 		API->setupNetwork();
+		opt.setupKnobs();
+		if (opt.exit_code != -1) {
+			return opt.exit_code;
+		}
 		Future<int> cliFuture = runCli(opt);
 		Future<Void> timeoutFuture = opt.exit_timeout ? timeExit(opt.exit_timeout) : Never();
 		auto f = stopNetworkAfter(success(cliFuture) || timeoutFuture);
